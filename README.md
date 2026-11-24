@@ -1,6 +1,6 @@
 # Data Processing Portfolio
 
-**Lorenzo Salvi** – Operations & Data Specialist
+**Lorenzo Salvi** – Operations & Data Specialist <br>
 PMO · Data Analysis · Monitoring & Evaluation · Process Automation
 
 This repository collects three data-processing projects I designed and wrote for my work in public administration. They cover the full chain of administrative data: collecting files filled in by many different bodies, cleaning and harmonizing them, validating them against rules and targets, and turning them into monitoring tools that non-technical colleagues can use.
