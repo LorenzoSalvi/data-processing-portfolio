@@ -1,0 +1,19 @@
+# Data must never be committed: this repository contains code only
+input/
+output/
+final_files_*/
+*.xlsx
+*.xls
+*.csv
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*_files/
+*.html
+
+# Python
+__pycache__/
+*.pyc
+.venv/

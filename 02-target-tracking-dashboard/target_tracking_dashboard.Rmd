@@ -1,0 +1,2788 @@
+---
+title: "Target Tracking Tool"
+author: "Lorenzo Salvi"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+editor_options:
+  chunk_output_type: console
+---
+
+<!--
+Target tracking dashboard for a national digital transformation programme.
+Data come from several CRM exports (organizations, applications, services,
+activated services, project dates) and are compared with the programme targets,
+nationally and for each of the six territorial areas.
+
+Anonymized and generalized version of a dashboard used in production:
+measures, areas, statuses and column names are generic, and target values are
+placeholders. Data are not included for confidentiality reasons.
+-->
+
+<style>
+
+body {
+text-align: justify;
+}
+
+h1, h2, h3 {
+text-align: center;
+}
+
+.navbar {
+background-color: #6aaaeb;
+color: white;
+}
+
+.navbar-brand {
+color: white;
+font-weight: bold;
+}
+
+.navbar a:hover {
+  background-color: #5f9ea0;
+  color: white;
+}
+
+table {
+  width: 100%;
+  height: 100%;
+}
+
+</style>
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.align = "center",
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(stringr)
+library(rebus)
+library(readxl)
+library(openxlsx)
+library(readr)
+library(ggplot2)
+library(maps)
+library(scales)
+library(flexdashboard)
+library(DT)
+
+# shared helper functions, including the ggplot theme theme_tracker()
+source("../helpers.R")
+```
+
+
+```{r basics}
+# reference date: services activated before this date belong to the baseline
+baseline_date <- make_date(year = 2021, month = 4, day = 1)
+
+# colours
+fill_colors <- c("Needs review (data issue)" = "#fff6f3",
+                 "Technical check failed" = "#080200",
+                 "Contract extended for long" = "#232323",
+                 "Currently rejected" = "#c0c0c0",
+                 "Pre-funding" = "#cc0000",
+                 "Contracting" = "#cc0000",
+                 "Completing" = "#cc0000",
+                 "First technical check" = "#ff8308",
+                 "Partial" = "#ff972f",
+                 "Further technical check" = "#ffab56",
+                 "Technical check passed" = "#00cc66")
+
+fill_alpha <- c("Needs review (data issue)" = 0.3,
+                "Technical check failed" = 0.3,
+                "Contract extended for long" = 0.3,
+                "Currently rejected" = 1,
+                "Pre-funding" = 0.3,
+                "Contracting" = 0.6,
+                "Completing" = 1,
+                "First technical check" = 1,
+                "Partial" = 1,
+                "Further technical check" = 1,
+                "Technical check passed" = 1)
+
+fill_averages <- c("Cities" = "#e74c3c",
+                   "Schools" = "#f39c12",
+                   "Health authorities" = "#2ecc71",
+                   "Regional bodies" = "#9b59b6")
+
+# application statuses
+active_statuses <- c("FUNDED", "UNDER REVIEW", "ACCEPTED", "ADMITTED", "ADMITTED WITH RESERVATION")
+
+inactive_statuses <- c("DRAFT", "PRE-DRAFT", "EXPIRED", "RENOUNCED",
+                       "CANCELLED", "WITHDRAWN", "NOT ACCEPTED", "NOT ADMITTED", "CLOSED")
+
+# Call X = call for Measure H projects (see chunk "measure a")
+
+# organizations excluded from the service averages after manual review
+excluded_orgs <- c("ORG_0001")
+```
+
+
+```{r read datasets}
+
+# legally active organizations and list of their codes. Local offices of
+# national agencies are not included: they are already excluded in the CRM report
+
+active_orgs <- read_excel("./../input/organizations.xlsx") %>%
+  filter(`Legal status` != "Dissolved") %>%
+  filter(`In public registry` == "Present") %>%
+  filter(!str_detect(`Org name`, "DISSOLVED"))
+
+active_org_codes <- pull(active_orgs, `Org code`)
+
+
+# live applications (active status, submitted by legally active organizations)
+
+live_applications <- read_csv2("./../input/applications.csv", locale=locale(encoding="latin1")) %>%
+  filter(Status %in% active_statuses) %>%
+  filter(`Applicant: Org code` %in% active_org_codes)
+
+# note: this last filter also removes about a hundred applications from active
+# organizations: they are local offices of national agencies, which are not in
+# the organizations table
+
+
+# rejected applications
+
+rejected_applications <- read_csv2("./../input/rejected.csv", locale=locale(encoding="latin1")) %>%
+  distinct(`Application ID`, .keep_all = TRUE) %>%
+  pull(`Application ID`)
+
+
+# applications at risk: contract still to be signed after many extension days
+
+risky_applications <- live_applications %>%
+  filter(`Contracting status` == "To be completed") %>%
+  filter(`Total extension days granted` > 180) %>%
+  pull(`Application ID`)
+
+
+# services requested in live applications of legally active organizations
+
+applied_services <- read_csv2("./../input/applied_services.csv", locale=locale(encoding="latin1")) %>%
+  filter(Status %in% active_statuses) %>%
+  filter(`Org code` %in% active_org_codes)
+
+applications_from_services <- applied_services %>%
+  distinct(`Application ID`)
+applications_without_services <- anti_join(live_applications, applications_from_services, by = "Application ID")
+
+
+# Channel E services activated according to the agreed activation rule.
+# Activation date conventionally equal to the date of the first notification
+
+activated_services_e <- read_csv2("./../input/activated_services.csv", locale=locale(encoding="latin1")) %>%
+  filter(Platform == "E") %>%
+  filter(`Service code` != "NULL") %>%
+  filter(`Deleted on platform` == 0) %>%
+  mutate(`Service name` = str_to_upper(`Service description`)) %>%
+  mutate(`Activation date` = case_when(
+    `Integration type` == "NONE" & !is.na(`Cost API call date`) & !is.na(`Payment integration date`) ~ "999",
+    `Integration type` == "SYNC" & (is.na(`Cost API call date`) | is.na(`Payment integration date`)) ~ "999",
+    `Integration type` == "SYNC" & !is.na(`First notification date`) & !is.na(`Cost API call date`) & !is.na(`Interoperability integration date`) & !is.na(`Payment integration date`) ~ `First notification date`,
+    `Integration type` == "NONE" & !is.na(`First notification date`) & is.na(`Cost API call date`) & !is.na(`Interoperability integration date`) & is.na(`Payment integration date`) ~ `First notification date`,
+    `Integration type` == "ASYNC" & !is.na(`First notification date`) & !is.na(`Interoperability integration date`) ~ `First notification date`,
+    TRUE ~ NA_character_)) %>%
+  filter(!is.na(`Activation date`) & `Activation date` != "999") %>%
+  mutate(`Activation date` = str_sub(`Activation date`, end = -8)) %>%
+  filter(`Org: Org code` %in% active_org_codes)
+
+# services actually activated, i.e.:
+# with an activation date
+# not deleted afterwards on the platform
+# with a valid service code (not NULL)
+# for channel E, the rule of the previous block applies
+
+activated_services <- read_csv2("./../input/activated_services.csv", locale=locale(encoding="latin1")) %>%
+  filter(`Service code` != "NULL") %>%
+  filter(`Deleted on platform` == 0) %>%
+  filter(Platform != "E") %>%
+  bind_rows(activated_services_e) %>%
+  filter(!is.na(`Activation date`)) %>%
+  mutate(`Activation date` = dmy(`Activation date`),
+         `Service description` = str_to_upper(`Service description`)) %>%
+  mutate(service_period = if_else(`Activation date` < baseline_date, "pre", "post")) %>%
+  filter(`Org: Org code` %in% active_org_codes)
+
+```
+
+```{r functions}
+# territorial areas: name used in the code = value in the data
+areas <- c(area_a = "AREA_A",
+           area_b = "AREA_B",
+           area_c = "AREA_C",
+           area_d = "AREA_D",
+           area_e = "AREA_E",
+           area_f = "AREA_F")
+
+
+# Counts the organizations of a target population, nationally ("all") and by
+# area, and checks that the areas add up to the national total.
+count_population <- function(population, label) {
+  n <- c(all    = nrow(population),
+         area_a = nrow(filter(population, Area == "AREA_A")),
+         area_b = nrow(filter(population, Area == "AREA_B")),
+         area_c = nrow(filter(population, Area == "AREA_C")),
+         area_d = nrow(filter(population, Area == "AREA_D")),
+         area_e = nrow(filter(population, Area == "AREA_E")),
+         area_f = nrow(filter(population, Area == "AREA_F")))
+
+  # population test
+  if (sum(n[-1]) == n[["all"]]) {
+    print(str_c("Test population ", label, " OK"))
+  } else {
+    stop(str_c("Area populations ", label, " differ from total population"))
+  }
+
+  return(n)
+}
+
+
+# Splits a national target among areas, in proportion to each area's share of
+# the target population, and checks that the area targets add up to the
+# national one (tolerance of 2 units for rounding).
+# Returns a named vector: all, area_a, ..., area_f.
+split_target <- function(target_all, n_population, label) {
+  targets <- round(target_all * (n_population / n_population[["all"]]), digits = 0)
+
+  # target test
+  if (abs(sum(targets[-1]) - target_all) <= 2) {
+    print(str_c("Test target ", label, " OK"))
+  } else {
+    stop(str_c("Area targets ", label, " differ from total target"))
+  }
+
+  return(targets)
+}
+
+
+# Bar chart of a measure compared with its targets, for the whole country
+# (area = "all") or for one area.
+#   data:         one row per application / organization / service to count
+#   x_col:        name of the column used as the single bar
+#   targets:      named list of target vectors, e.g. list("Q3 2024" = target_a_Q3_24)
+#   area_col:     name of the column holding the area in this dataset
+#   fill_col:     column used to colour the bar (NULL = plain green bar)
+#   fill_values / alpha_values: manual colour and transparency scales
+# .data[[...]] lets ggplot use a column whose name is stored in a variable.
+plot_progress <- function(data, x_col, targets, area = "all", area_col = "Applicant: Area",
+                          y_label = "Applications", fill_col = NULL,
+                          fill_values = NULL, alpha_values = NULL,
+                          offset_all = 300, offset_area = 100) {
+
+  if (area != "all") {
+    data <- data %>% filter(.data[[area_col]] == areas[[area]])
+  }
+
+  offset <- if (area == "all") offset_all else offset_area
+
+  if (is.null(fill_col)) {
+    p <- ggplot(data, aes(x = .data[[x_col]])) +
+      geom_bar(fill = "#00cc66")
+  } else if (is.null(alpha_values)) {
+    p <- ggplot(data, aes(x = .data[[x_col]], fill = .data[[fill_col]])) +
+      geom_bar() +
+      scale_fill_manual(values = fill_values)
+  } else {
+    p <- ggplot(data, aes(x = .data[[x_col]], fill = .data[[fill_col]], alpha = .data[[fill_col]])) +
+      geom_bar() +
+      scale_fill_manual(values = fill_values) +
+      scale_alpha_manual(values = alpha_values)
+  }
+
+  # one horizontal line (with its label) for each target
+  for (label in names(targets)) {
+    value <- targets[[label]][[area]]
+    p <- p +
+      geom_hline(yintercept = value) +
+      annotate("text", x = 1, y = (value + offset), label = label)
+  }
+
+  p +
+    theme_tracker(angle = 0) +
+    ylab(y_label)
+}
+
+
+# Average number of services per organization, by organization type, compared
+# with the target average; for the whole country or for one area.
+service_averages <- function(services, area = "all") {
+
+  if (area != "all") {
+    services <- services %>% filter(`Org: Area` == areas[[area]])
+  }
+
+  services %>%
+    group_by(`Org type (m)`) %>%
+    summarise(Organizations = n_distinct(`Org: Org code`),
+              Services = n(),
+              `Average services` = round(Services/Organizations, digits = 2)) %>%
+    ungroup() %>%
+    mutate(`Org type (m)` = fct_relevel(`Org type (m)`, c("Cities", "Schools", "Health authorities", "Regional bodies", "OTHER"))) %>%
+    mutate(`Target average` = case_when(
+      `Org type (m)` == "Cities" ~ 20,
+      `Org type (m)` == "Schools" ~ 6,
+      `Org type (m)` == "Health authorities" ~ 10,
+      `Org type (m)` == "Regional bodies" ~ 10,
+      `Org type (m)` == "OTHER" ~ NA_integer_)) %>%
+    arrange(`Org type (m)`) %>%
+    rename(`Organization type` = `Org type (m)`)
+}
+```
+
+
+```{r targets, include=FALSE}
+# NOTE: all target values below are placeholders, not the real programme targets
+
+## Measure A
+
+n_population_a <- active_orgs %>%
+  filter(`Org type` == "Cities" | `Org type` == "Schools" | `Org type` == "Health authorities" | `Org type` == "Provinces") %>%
+  count_population("A")
+
+target_a_Q3_24 <- split_target(3200, n_population_a, "A Q3 '24")
+target_a_Q2_26 <- split_target(7800, n_population_a, "A Q2 '26")
+
+
+## Measure B (target = share of the target population)
+
+n_population_b <- active_orgs %>%
+  filter(`Org type` == "Cities" | `Org type` == "Schools") %>%
+  count_population("B")
+
+target_b_Q4_24 <- split_target(round(n_population_b[["all"]]*0.35, digits = 0), n_population_b, "B Q4 '24")
+target_b_Q2_26 <- split_target(round(n_population_b[["all"]]*0.75, digits = 0), n_population_b, "B Q2 '26")
+
+
+## Measure C (same target population for both channels)
+
+n_population_c <- active_orgs %>%
+  filter(`Org type` == "Cities" | `Org type` == "Schools" | `Org type` == "Universities" | `Org type` == "Research institutes" |
+           `Org type` == "Health authorities" | `Org type` == "Regional bodies" | `Org type` == "Autonomous provinces") %>%
+  count_population("C")
+
+target_c1_orgs_Q4_23 <- split_target(4800, n_population_c, "C1 organizations Q4 '23")
+target_c1_orgs_Q2_26 <- split_target(9500, n_population_c, "C1 organizations Q2 '26")
+target_c1_services_Q4_23 <- split_target(12000, n_population_c, "C1 services Q4 '23")
+
+target_c2_orgs_Q4_23 <- split_target(9000, n_population_c, "C2 organizations Q4 '23")
+target_c2_orgs_Q2_26 <- split_target(12000, n_population_c, "C2 organizations Q2 '26")
+target_c2_services_Q4_23 <- split_target(250000, n_population_c, "C2 services Q4 '23")
+
+
+## Measure D
+
+n_population_d <- active_orgs %>%
+  count_population("D")
+
+target_d_Q1_26 <- split_target(7200, n_population_d, "D Q1 '26")
+
+
+## Measure E
+
+n_population_e <- active_orgs %>%
+  filter(`Org type` == "Cities" | `Org type` == "National agencies") %>%
+  count_population("E")
+
+target_e_Q4_23 <- split_target(600, n_population_e, "E Q4 '23")
+target_e_Q2_26 <- split_target(5000, n_population_e, "E Q2 '26")
+
+
+## Measure F
+
+n_population_f <- active_orgs %>%
+  filter(`Org type` == "Cities" | `Org type` == "Regional bodies" | `Org type` == "Autonomous provinces" | `Org type` == "Universities" | `Org type` == "Research institutes" | `Org type` == "Health authorities") %>%
+  count_population("F")
+
+target_f_Q4_24 <- split_target(350, n_population_f, "F Q4 '24")
+target_f_Q2_26 <- split_target(900, n_population_f, "F Q2 '26")
+
+
+# targets shown in each chart (label = text next to the line)
+targets_a <- list("Q3 2024" = target_a_Q3_24, "Q2 2026" = target_a_Q2_26)
+targets_b <- list("Q4 2024" = target_b_Q4_24, "Q2 2026" = target_b_Q2_26)
+targets_c1 <- list("Q4 2023" = target_c1_orgs_Q4_23, "Q2 2026" = target_c1_orgs_Q2_26)
+targets_c2 <- list("Q4 2023" = target_c2_orgs_Q4_23, "Q2 2026" = target_c2_orgs_Q2_26)
+targets_d <- list("Q1 2026" = target_d_Q1_26)
+targets_e <- list("Q4 2023" = target_e_Q4_23, "Q2 2026" = target_e_Q2_26)
+targets_f <- list("Q4 2024" = target_f_Q4_24, "Q2 2026" = target_f_Q2_26)
+```
+
+
+```{r measure a}
+# count of Measure A + multi-measure applications with no services to migrate
+# to the hub, based on the service "Destination"
+# the number must match the applications found with "awarded amount (parent 1)"
+
+# organizations with a Measure H application: they are removed from Measure A
+# at the end, since the two measures cannot be counted twice
+
+orgs_h <- live_applications %>%
+  filter(str_detect(`Call title`, "Measure H")) %>%
+  distinct(`Applicant: Org code`) %>%
+  pull(`Applicant: Org code`)
+
+applications_a_pre <- applied_services %>%
+  filter(str_detect(`Call title`, "Measure A") |
+           str_detect(`Call title`, "Measures H and A")) %>%
+  count(`Application ID`, Measure, Destination) %>%
+  mutate(value = case_when(
+    Measure == "Measure A" ~ 0,
+    Destination == "Hub" ~ 1,
+    TRUE ~ 0)) %>%
+  group_by(`Application ID`, Measure) %>%
+  summarise(sum(value)) %>%
+  ungroup() %>%
+  filter(`sum(value)` == 0) %>%
+  left_join(live_applications[,c("Application ID", "Applicant: Org code", "Status", "Project status", "Last technical check result", "Contracting status", "Applicant: Area", "Applicant: Org type")], by = "Application ID") %>%
+  mutate(`Progress status` = case_when(
+    `Application ID` %in% rejected_applications ~ "Currently rejected",
+    `Application ID` %in% risky_applications ~ "Contract extended for long",
+    Status == "UNDER REVIEW" | Status == "ADMITTED" | Status == "ACCEPTED" ~ "Pre-funding",
+    `Contracting status` == "To be completed" ~ "Contracting",
+    `Project status` == "STARTED" & is.na(`Last technical check result`) ~ "Completing",
+    `Project status` == "STARTED" & `Last technical check result` == "Partial" ~ "Partial",
+    `Project status` == "UNDER REVIEW" & is.na(`Last technical check result`) ~ "First technical check",
+    `Project status` == "UNDER REVIEW" & `Last technical check result` == "Partial" ~ "Further technical check",
+    `Last technical check result` == "Positive" ~ "Technical check passed",
+    `Last technical check result` == "Negative" ~ "Technical check failed",
+    TRUE ~ "Needs review (data issue)")) %>%
+  mutate(`Progress status` = fct_relevel(`Progress status`, "Needs review (data issue)", "Currently rejected", "Technical check failed", "Contract extended for long", "Pre-funding", "Contracting", "Completing", "First technical check", "Partial", "Further technical check", "Technical check passed")) %>%
+  mutate(`Measure A` = "Measure A") %>%
+  arrange(desc(`Progress status`))
+
+applications_a_distinct <- applications_a_pre %>%
+  distinct(`Applicant: Org code`, .keep_all = TRUE)
+
+applications_a <- applications_a_distinct %>%
+  filter(!`Applicant: Org code` %in% orgs_h)
+
+
+applications_a_zero_award <- live_applications %>%
+  filter(str_detect(`Call title`, "Measure A") |
+           str_detect(`Call title`, "Measures H and A") & `Awarded amount (parent 1)` == 0)
+
+
+# applications classified differently by the two methods: exported for checking
+contradictory_applications <- anti_join(applications_a_pre, applications_a_zero_award, by = "Application ID") %>%
+  left_join(live_applications[,c("Application ID", "Call title", "Awarded amount (parent 1)", "Phase")], by = "Application ID") %>%
+  rename(`Hub service present` = `sum(value)`)
+write.xlsx(contradictory_applications, str_c("./output/ambiguous_applications.xlsx"))
+
+projects_removed_h <- nrow(applications_a_distinct) - nrow(applications_a)
+```
+
+
+```{r measure b}
+
+applications_b <- live_applications %>%
+  filter(str_detect(`Call title`, "Measure B")) %>%
+  mutate(`Progress status` = case_when(
+    `Application ID` %in% rejected_applications ~ "Currently rejected",
+    `Application ID` %in% risky_applications ~ "Contract extended for long",
+    Status == "UNDER REVIEW" | Status == "ADMITTED" | Status == "ACCEPTED" ~ "Pre-funding",
+    `Contracting status` == "To be completed" ~ "Contracting",
+    `Project status` == "STARTED" & is.na(`Last technical check result`) ~ "Completing",
+    `Project status` == "STARTED" & `Last technical check result` == "Partial" ~ "Partial",
+    `Project status` == "UNDER REVIEW" & is.na(`Last technical check result`) ~ "First technical check",
+    `Project status` == "UNDER REVIEW" & `Last technical check result` == "Partial" ~ "Further technical check",
+    `Last technical check result` == "Positive" ~ "Technical check passed",
+    `Last technical check result` == "Negative" ~ "Technical check failed",
+    TRUE ~ "Needs review (data issue)")) %>%
+  mutate(`Progress status` = fct_relevel(`Progress status`, "Needs review (data issue)", "Currently rejected", "Technical check failed", "Contract extended for long", "Pre-funding", "Contracting", "Completing", "First technical check", "Partial", "Further technical check", "Technical check passed")) %>%
+  mutate(`Measure B` = "Measure B") %>%
+  arrange(desc(`Progress status`)) %>%
+  distinct(`Applicant: Org code`, .keep_all = TRUE)
+```
+
+```{r measure c1}
+
+# organization target
+
+# codes of organizations with at least one funded Channel 1 application
+funded_codes_c1 <- live_applications %>%
+  filter(str_detect(`Call title`, "Measure C - Channel 1")) %>%
+  filter(Status == "FUNDED") %>%
+  mutate(`Funded C1 application` = "YES") %>%
+  select(`Org: Org code` = `Applicant: Org code`, `Funded C1 application`) %>%
+  distinct(`Org: Org code`, .keep_all = TRUE)
+
+# all Measure C organizations, split into baseline (pre) and new (post, i.e. with post-baseline services only)
+orgs_period_c1 <- activated_services %>%
+  filter(Platform == "C1") %>%
+  arrange(service_period) %>%
+  distinct(`Org: Org code`, .keep_all = TRUE) %>%
+  rename(period = service_period) %>%
+  select(-`Service code`, -`Active service: Name`, -`Service description`, -`Deleted on platform`)
+
+# eligible organizations
+eligible_orgs_c1 <- orgs_period_c1 %>%
+  mutate(`Measure C` = "Channel 1") %>%
+  left_join(active_orgs[,c("Org code", "Org type")], by = c("Org: Org code" = "Org code")) %>%
+  left_join(funded_codes_c1, by = "Org: Org code") %>%
+  mutate(Eligible = case_when(
+    period == "pre" ~ "YES",
+    `Org type` == "Schools" ~ "YES",
+    `Org type` != "Schools" & `Funded C1 application` == "YES" ~ "YES",
+    TRUE ~ "NO")) %>%
+  select(`Org: Org name`, `Org: Org code`, `Org: Region`, Platform, period, `Measure C`, `Org type`, `Funded C1 application`, Eligible, `Org: Area`) %>%
+  filter(Eligible == "YES")
+
+n_eligible_c1 <- round(nrow(eligible_orgs_c1), digits = 0)
+n_baseline_c1 <- round(nrow(eligible_orgs_c1 %>% filter(period == "pre")), digits = 0)
+
+
+# average targets
+
+# services activated by eligible organizations, only for organizations in the target population
+eligible_services_c1 <- activated_services %>%
+  filter(Platform == "C1") %>%
+  select(`Org: Org name`, `Org: Org code`, `Service code`, `Service description`, Platform, `Org: Area`) %>%
+  left_join(eligible_orgs_c1[,c("Org: Org code", "Eligible")], by = "Org: Org code") %>%
+  left_join(active_orgs[,c("Org code", "Org type")], by = c("Org: Org code" = "Org code")) %>%
+  mutate(`Org type (m)` = case_when(
+    `Org type` == "Universities" | `Org type` == "Research institutes" | `Org type` == "Schools" ~ "Schools",
+    `Org type` == "Autonomous provinces" | `Org type` == "Regional bodies" ~ "Regional bodies",
+    `Org type` == "Veterinary institutes" | `Org type` == "Public care agencies" | `Org type` == "Other bodies" ~ "OTHER",
+    `Org type` == "Cities" ~ "Cities",
+    `Org type` == "Health authorities" ~ "Health authorities",
+    TRUE ~ "ALERT")) %>%
+  filter(!`Org: Org code` %in% excluded_orgs) %>%
+  filter(Eligible == "YES")
+
+
+# potential services (applied for but not yet activated: we want to count them too)
+# they necessarily belong to baseline or new eligible organizations (with a funded application)
+# they necessarily belong to organizations in the target population
+# they are split into the four categories, removing those already activated
+
+potential_services_c1 <- applied_services %>%
+  filter(str_detect(`Call title`, "Measure C - Channel 1")) %>%
+  mutate(`Service description` = str_to_upper(`Requested service name`)) %>%
+  left_join(active_orgs[,c("Org code", "Org type")], by = "Org code") %>%
+  mutate(`Org type (m)` = case_when(
+    `Org type` == "Universities" | `Org type` == "Research institutes" | `Org type` == "Schools" ~ "Schools",
+    `Org type` == "Autonomous provinces" | `Org type` == "Regional bodies" ~ "Regional bodies",
+    `Org type` == "Veterinary institutes" | `Org type` == "Public care agencies" | `Org type` == "Other bodies" ~ "OTHER",
+    `Org type` == "Cities" ~ "Cities",
+    `Org type` == "Health authorities" ~ "Health authorities",
+    TRUE ~ "ALERT")) %>%
+  filter(!`Org code` %in% excluded_orgs) %>%
+  anti_join(activated_services, by = c("Org code" = "Org: Org code", "Service code")) %>%
+  anti_join(activated_services, by = c("Org code" = "Org: Org code", "Service description")) %>%
+  filter(is.na(`Service code`)) %>%
+  rename(`Org: Org name` = `Org name`, `Org: Org code` = `Org code`, `Org: Area` = Area) %>%
+  mutate(Platform = "C1",
+         Eligible = "potential") %>%
+  select(`Org: Org name`, `Org: Org code`, `Service code`, `Service description`, Platform, `Org: Area`, Eligible, `Org type`, `Org type (m)`) %>%
+  bind_rows(eligible_services_c1)
+```
+
+```{r measure c2}
+
+# organization target
+
+# codes of organizations with at least one funded Channel 2 application
+funded_codes_c2 <- live_applications %>%
+  filter(str_detect(`Call title`, "Measure C - Channel 2")) %>%
+  filter(Status == "FUNDED") %>%
+  mutate(`Funded C2 application` = "YES") %>%
+  select(`Org: Org code` = `Applicant: Org code`, `Funded C2 application`) %>%
+  distinct(`Org: Org code`, .keep_all = TRUE)
+
+# all Measure C organizations, split into baseline (pre) and new (post, i.e. with post-baseline services only)
+orgs_period_c2 <- activated_services %>%
+  filter(Platform == "C2") %>%
+  arrange(service_period) %>%
+  distinct(`Org: Org code`, .keep_all = TRUE) %>%
+  rename(period = service_period) %>%
+  select(-`Service code`, -`Active service: Name`, -`Service description`, -`Deleted on platform`)
+
+# eligible organizations
+eligible_orgs_c2 <- orgs_period_c2 %>%
+  mutate(`Measure C` = "Channel 2") %>%
+  left_join(active_orgs[,c("Org code", "Org type")], by = c("Org: Org code" = "Org code")) %>%
+  left_join(funded_codes_c2, by = "Org: Org code") %>%
+  mutate(Eligible = case_when(
+    period == "pre" ~ "YES",
+    `Org type` == "Schools" ~ "YES",
+    `Org type` != "Schools" & `Funded C2 application` == "YES" ~ "YES",
+    TRUE ~ "NO")) %>%
+  select(`Org: Org name`, `Org: Org code`, `Org: Region`, Platform, period, `Measure C`, `Org type`, `Funded C2 application`, Eligible, `Org: Area`) %>%
+  filter(Eligible == "YES")
+
+n_eligible_c2 <- round(nrow(eligible_orgs_c2), digits = 0)
+n_baseline_c2 <- round(nrow(eligible_orgs_c2 %>% filter(period == "pre")), digits = 0)
+
+
+# average targets
+
+# services activated by eligible organizations, only for organizations in the target population
+eligible_services_c2 <- activated_services %>%
+  filter(Platform == "C2") %>%
+  select(`Org: Org name`, `Org: Org code`, `Service code`, `Service description`, Platform, `Org: Area`) %>%
+  left_join(eligible_orgs_c2[,c("Org: Org code", "Eligible")], by = "Org: Org code") %>%
+  left_join(active_orgs[,c("Org code", "Org type")], by = c("Org: Org code" = "Org code")) %>%
+  mutate(`Org type (m)` = case_when(
+    `Org type` == "Universities" | `Org type` == "Research institutes" | `Org type` == "Schools" ~ "Schools",
+    `Org type` == "Autonomous provinces" | `Org type` == "Regional bodies" ~ "Regional bodies",
+    `Org type` == "Veterinary institutes" | `Org type` == "Public care agencies" | `Org type` == "Other bodies" ~ "OTHER",
+    `Org type` == "Cities" ~ "Cities",
+    `Org type` == "Health authorities" ~ "Health authorities",
+    TRUE ~ "ALERT")) %>%
+  filter(!`Org: Org code` %in% excluded_orgs) %>%
+  filter(Eligible == "YES")
+
+
+# potential services (applied for but not yet activated: we want to count them too)
+# they necessarily belong to baseline or new eligible organizations (with a funded application)
+# they necessarily belong to organizations in the target population
+# they are split into the four categories, removing those already activated
+
+potential_services_c2 <- applied_services %>%
+  filter(str_detect(`Call title`, "Measure C - Channel 2")) %>%
+  mutate(`Service description` = str_to_upper(`Requested service name`)) %>%
+  left_join(active_orgs[,c("Org code", "Org type")], by = "Org code") %>%
+  mutate(`Org type (m)` = case_when(
+    `Org type` == "Universities" | `Org type` == "Research institutes" | `Org type` == "Schools" ~ "Schools",
+    `Org type` == "Autonomous provinces" | `Org type` == "Regional bodies" ~ "Regional bodies",
+    `Org type` == "Veterinary institutes" | `Org type` == "Public care agencies" | `Org type` == "Other bodies" ~ "OTHER",
+    `Org type` == "Cities" ~ "Cities",
+    `Org type` == "Health authorities" ~ "Health authorities",
+    TRUE ~ "ALERT")) %>%
+  filter(!`Org code` %in% excluded_orgs) %>%
+  anti_join(activated_services, by = c("Org code" = "Org: Org code", "Taxonomy code" = "Service code")) %>%
+  rename(`Org: Org name` = `Org name`, `Org: Org code` = `Org code`, `Org: Area` = Area) %>%
+  mutate(Platform = "C2",
+         Eligible = "potential") %>%
+  select(`Org: Org name`, `Org: Org code`, `Service code`, `Service description`, Platform, `Org: Area`, Eligible, `Org type`, `Org type (m)`) %>%
+  bind_rows(eligible_services_c2)
+```
+
+
+```{r measure d}
+activated_d <- active_orgs %>%
+  mutate(Activations = case_when(
+    `Digital ID method 1` == TRUE & `Digital ID method 2` == TRUE ~ "Both methods",
+    `Digital ID method 1` == TRUE & `Digital ID method 2` == FALSE ~ "Method 1 only",
+    `Digital ID method 1` == FALSE & `Digital ID method 2` == TRUE ~ "Method 2 only",
+    TRUE ~ "KO")) %>%
+  filter(Activations == "Both methods" | Activations == "Method 1 only" | Activations == "Method 2 only") %>%
+  mutate(`Measure D` = "Digital ID")
+
+id_colors <- c("Both methods" = "#00ffbf", "Method 1 only" = "#0040ff", "Method 2 only" = "#ffbf00")
+```
+
+
+```{r measure e}
+funded_e <- live_applications %>%
+  filter(str_detect(`Call title`, "Measure E")) %>%
+  filter(Status == "FUNDED") %>%
+  mutate(`Funded E application` = "YES") %>%
+  select(`Org: Org code` = `Applicant: Org code`,
+         `Funded E application`) %>%
+  distinct(`Org: Org code`, .keep_all = TRUE)
+
+activated_e <- activated_services %>%
+  filter(Platform == "E") %>%
+  distinct(`Org: Org code`, .keep_all = TRUE) %>%
+  mutate(`Measure E` = "Channel E") %>%
+  left_join(funded_e, by = "Org: Org code") %>%
+  rename(Eligible = `Funded E application`) %>%
+  select(`Org: Org name`, `Org: Org code`, `Org: Area`, `Measure E`, Eligible) %>%
+  filter(Eligible == "YES")
+
+# organizations that (1) applied but are not funded yet or (2) are funded but have not activated yet
+
+potential_e <- live_applications %>%
+  filter(str_detect(`Call title`, "Measure E")) %>%
+  anti_join(activated_e, by = c("Applicant: Org code" = "Org: Org code")) %>%
+  distinct(`Applicant: Org code`, .keep_all = TRUE) %>%
+  mutate(`Measure E` = "Channel E", Eligible = "Potential") %>%
+  select(`Org: Org name` = `Applicant: Org name`,
+         `Org: Org code` = `Applicant: Org code`,
+         `Org: Area` = `Applicant: Area`,
+         `Measure E`, Eligible)
+
+orgs_e <- bind_rows(activated_e, potential_e)
+
+e_colors <- c("YES" = "#00cc66", "Potential" = "#00cc66")
+e_alpha <- c("YES" = 1, "Potential" = 0.3)
+```
+
+
+```{r measure f}
+
+funded_codes_f <- live_applications %>%
+  filter(str_detect(`Call title`, "Measure F") & !str_detect(`Call title`, "Address registry") & !str_detect(`Call title`, "Wallet")) %>%
+  filter(Status == "FUNDED") %>%
+  mutate(`Funded F application` = "YES") %>%
+  select(`Org: Org code` = `Applicant: Org code`,
+         `Funded F application`) %>%
+  distinct(`Org: Org code`, .keep_all = TRUE)
+
+eligible_services_f <- activated_services %>%
+  filter(Platform == "F") %>%
+  left_join(funded_codes_f, by = "Org: Org code") %>%
+  filter(`Funded F application` == "YES") %>%
+  mutate(`Measure F` = "Interoperability")
+```
+
+
+```{r progress}
+project_dates <- read_csv2("./../input/project_dates.csv", locale=locale(encoding="latin1")) %>%
+  mutate(`Funding decree date` = dmy(`Funding decree date`),
+         `Contracting deadline` = dmy(`Contracting deadline`),
+         `Contracting date` = dmy(`Contracting date`),
+         `Planned completion date` = dmy(`Planned completion date`),
+         `Activity completion deadline` = dmy(`Activity completion deadline`),
+         `Activity completion date` = dmy_hm(`Activity completion date`),
+         `Positive technical check date` = dmy_hm(`Positive technical check date`),
+         `Payment processing date` = dmy_hm(`Payment processing date`),
+         `Paid date` = dmy_hm(`Paid date`),
+         `Closing date` = dmy(`Closing date`),
+         download_date = today()) %>%
+  mutate(`Activity completion date` = floor_date(`Activity completion date`, unit = "day"),
+         `Positive technical check date` = floor_date(`Positive technical check date`, unit = "day"),
+         `Payment processing date` = floor_date(`Payment processing date`, unit = "day"),
+         `Paid date` = floor_date(`Paid date`, unit = "day")) %>%
+  mutate(Measure = case_when(
+    str_detect(`Call title`, "Measures H and A") ~ "Multi-measure",
+    str_detect(`Call title`, "Measure A") ~ "A",
+    str_detect(`Call title`, "Measure B") ~ "B",
+    str_detect(`Call title`, "Measure C - Channel 2") ~ "C2",
+    str_detect(`Call title`, "Measure C - Channel 1") ~ "C1",
+    str_detect(`Call title`, "Measure D - Digital ID") ~ "D ID",
+    str_detect(`Call title`, "Measure D - Civil registry") ~ "D Registry",
+    str_detect(`Call title`, "Measure E") ~ "E",
+    str_detect(`Call title`, "Measure F") & !str_detect(`Call title`, "Address registry") ~ "F Interop",
+    str_detect(`Call title`, "Measure F") & str_detect(`Call title`, "Address registry") ~ "F Address",
+    str_detect(`Call title`, "Measure H") ~ "H",
+    TRUE ~ "Other")) %>%
+  filter(Measure != "Other") %>%
+  mutate(Measure = fct_relevel(Measure, c("A", "B", "C1", "C2", "D ID", "D Registry", "E", "F Interop", "F Address", "Multi-measure", "H"))) %>%
+  mutate(Population = case_when(
+    Measure == "E" ~ "Cities",
+    str_detect(`Call title`, "- Cities") ~ "Cities",
+    str_detect(`Call title`, "- Schools") ~ "Schools",
+    TRUE ~ "Other bodies")) %>%
+  mutate(Population = fct_relevel(Population, c("Cities", "Schools", "Other bodies"))) %>%
+  select(Project = `Application ID`,
+         Organization = `Applicant: Org name`,
+         `Org code`,
+         Measure,
+         Population,
+         Area = `Applicant: Area`,
+         Phase,
+         download_date,
+         funding_decree_date = `Funding decree date`,
+         contracting_date = `Contracting date`,
+         technical_check_date = `Positive technical check date`,
+         payment_processing_date = `Payment processing date`,
+         paid_date = `Paid date`)
+
+not_funded <- project_dates %>%
+  filter(is.na(funding_decree_date))
+
+# completion
+
+completion <- project_dates %>%
+  filter(!is.na(funding_decree_date)) %>%
+  group_by(funding_decree_date, Measure, Population) %>%
+  summarise(`Funded projects` = n(), `Technical check passed` = sum(!is.na(technical_check_date)), Paid = sum(!is.na(paid_date))) %>%
+  ungroup() %>%
+  mutate(`% Technical check passed` = round((`Technical check passed` / `Funded projects`)*100, digits = 2),
+         `% Paid` = round((Paid / `Funded projects`)*100, digits = 2)) %>%
+  rename(`Decree of` = funding_decree_date)
+
+
+# contracting
+
+df_contracting <- project_dates %>%
+  filter(!is.na(funding_decree_date) & !is.na(contracting_date)) %>%
+  select(Measure, Population, Area, funding_decree_date, contracting_date) %>%
+  mutate(aging = contracting_date - funding_decree_date) %>%
+  filter(aging > 0)
+
+avg_contracting <- df_contracting %>%
+  group_by(funding_decree_date, Measure, Population) %>%
+  summarise(average = mean(aging)) %>%
+  ungroup() %>%
+  mutate(average = round(average, digits = 0)) %>%
+  rename(`Decree of` = funding_decree_date, `Average contracting time` = average)
+
+plot_contracting <- ggplot(avg_contracting) +
+  geom_col(aes(x = `Decree of`, y = `Average contracting time`)) +
+  geom_line(aes(x = `Decree of`, y = `Average contracting time`)) +
+  theme_tracker(angle = 45) +
+  facet_grid(rows = vars(Measure), cols = vars(Population))
+
+
+# implementation
+
+df_implementation <- project_dates %>%
+  filter(!is.na(contracting_date) & !is.na(technical_check_date)) %>%
+  mutate(technical_check_date = ymd(technical_check_date)) %>%
+  select(Measure, Population, Area, funding_decree_date, contracting_date, technical_check_date) %>%
+  mutate(aging = technical_check_date - contracting_date) %>%
+  filter(aging > 0)
+
+avg_implementation <- df_implementation %>%
+  group_by(funding_decree_date, Measure, Population) %>%
+  summarise(average = mean(aging)) %>%
+  ungroup() %>%
+  mutate(average = round(average, digits = 0)) %>%
+  rename(`Decree of` = funding_decree_date, `Average implementation time` = average)
+
+plot_implementation <- ggplot(avg_implementation) +
+  geom_col(aes(x = `Decree of`, y = `Average implementation time`)) +
+  geom_line(aes(x = `Decree of`, y = `Average implementation time`)) +
+  theme_tracker(angle = 45) +
+  facet_grid(rows = vars(Measure), cols = vars(Population))
+
+
+# assembly
+
+df_aging <- completion %>%
+  left_join(avg_contracting, by = c("Decree of", "Measure", "Population")) %>%
+  left_join(avg_implementation, by = c("Decree of", "Measure", "Population"))
+
+plot_aging <- ggplot(df_aging %>% pivot_longer(cols = c(`% Technical check passed`, `% Paid`), values_to = "% Progress", names_to = "Progress type")) +
+  geom_point(aes(x = `Decree of`, y = `% Progress`, color = `Progress type`, size = `Funded projects`)) +
+  theme_tracker(angle = 45) +
+  facet_grid(rows = vars(Measure), cols = vars(Population)) +
+  labs(color = "Technical checks & payments", size = "Number of projects funded in each window")
+```
+
+
+This document was produced on <b>`r format(today(), "%d/%m/%y")`.</b>
+
+All areas
+=====================================
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure A</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target A Q3 2024
+```{r}
+valueBox(target_a_Q3_24[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target A Q2 2026
+```{r}
+valueBox(target_a_Q2_26[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_a %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_a), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+### Projects removed for joining Call X
+```{r}
+valueBox(projects_removed_h, color = "#faeed4", icon = "fa-solid fa-bell")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart A
+```{r}
+plot_progress(applications_a, "Measure A", targets_a,
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table A
+```{r}
+datatable(applications_a %>% count(Measure = `Measure A`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Count of organizations by type
+```{r}
+datatable(applications_a %>% count(`Organization type` = `Applicant: Org type`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure B</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target B Q4 2024
+```{r}
+valueBox(target_b_Q4_24[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target B Q2 2026
+```{r}
+valueBox(target_b_Q2_26[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_b %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_b), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart B
+```{r}
+plot_progress(applications_b, "Measure B", targets_b,
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table B
+```{r}
+datatable(applications_b %>% count(Measure = `Measure B`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 1</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C Q4 2023
+```{r}
+valueBox(target_c1_orgs_Q4_23[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C Q2 2026
+```{r}
+valueBox(target_c1_orgs_Q2_26[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(n_eligible_c1, color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c1 %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C
+```{r}
+plot_progress(eligible_orgs_c1, "Measure C", targets_c1,
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C
+```{r}
+datatable(service_averages(eligible_services_c1), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C
+```{r}
+datatable(service_averages(potential_services_c1), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 2</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C2 Q4 2023
+```{r}
+valueBox(target_c2_orgs_Q4_23[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C2 Q2 2026
+```{r}
+valueBox(target_c2_orgs_Q2_26[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(n_eligible_c2, color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c2 %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C2
+```{r}
+plot_progress(eligible_orgs_c2, "Measure C", targets_c2,
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C2
+```{r}
+datatable(service_averages(eligible_services_c2), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C2
+```{r}
+datatable(service_averages(potential_services_c2), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure D</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target D Q1 2026
+```{r}
+valueBox(target_d_Q1_26[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations that activated the digital ID
+```{r}
+valueBox(nrow(activated_d), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart D
+```{r}
+plot_progress(activated_d, "Measure D", targets_d,
+              area_col = "Area", y_label = "Activated organizations",
+              fill_col = "Activations", fill_values = id_colors, offset_all = 500)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure E</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target E Q4 2023
+```{r}
+valueBox(target_e_Q4_23[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target E Q2 2026
+```{r}
+valueBox(target_e_Q2_26[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations with Channel E active and a funded application
+```{r}
+valueBox(nrow(activated_e), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations E
+```{r}
+valueBox(nrow(potential_e), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart E
+```{r}
+plot_progress(orgs_e, "Measure E", targets_e,
+              area_col = "Org: Area", y_label = "Organizations",
+              fill_col = "Eligible", fill_values = e_colors, alpha_values = e_alpha)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure F</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target F Q4 2024
+```{r}
+valueBox(target_f_Q4_24[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target F Q2 2026
+```{r}
+valueBox(target_f_Q2_26[["all"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### APIs activated under funded applications
+```{r}
+valueBox(nrow(eligible_services_f), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart F
+```{r}
+plot_progress(eligible_services_f, "Measure F", targets_f,
+              area_col = "Org: Area", y_label = "API", offset_area = 50)
+```
+
+
+Area A
+=====================================
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure A</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target A Q3 2024
+```{r}
+valueBox(target_a_Q3_24[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target A Q2 2026
+```{r}
+valueBox(target_a_Q2_26[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_a %>% filter(`Applicant: Area` == "AREA_A") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_a %>% filter(`Applicant: Area` == "AREA_A")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart A
+```{r}
+plot_progress(applications_a, "Measure A", targets_a, area = "area_a",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table A
+```{r}
+datatable(applications_a %>% filter(`Applicant: Area` == "AREA_A") %>% count(Measure = `Measure A`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure B</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target B Q4 2024
+```{r}
+valueBox(target_b_Q4_24[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target B Q2 2026
+```{r}
+valueBox(target_b_Q2_26[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_b %>% filter(`Applicant: Area` == "AREA_A") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_b %>% filter(`Applicant: Area` == "AREA_A")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart B
+```{r}
+plot_progress(applications_b, "Measure B", targets_b, area = "area_a",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table B
+```{r}
+datatable(applications_b %>% filter(`Applicant: Area` == "AREA_A") %>% count(Measure = `Measure B`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 1</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C Q4 2023
+```{r}
+valueBox(target_c1_orgs_Q4_23[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C Q2 2026
+```{r}
+valueBox(target_c1_orgs_Q2_26[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c1 %>% filter(`Org: Area` == "AREA_A")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c1 %>% filter(`Org: Area` == "AREA_A") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C
+```{r}
+plot_progress(eligible_orgs_c1, "Measure C", targets_c1, area = "area_a",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C
+```{r}
+datatable(service_averages(eligible_services_c1, area = "area_a"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C
+```{r}
+datatable(service_averages(potential_services_c1, area = "area_a"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 2</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C2 Q4 2023
+```{r}
+valueBox(target_c2_orgs_Q4_23[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C2 Q2 2026
+```{r}
+valueBox(target_c2_orgs_Q2_26[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c2 %>% filter(`Org: Area` == "AREA_A")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c2 %>% filter(`Org: Area` == "AREA_A") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C2
+```{r}
+plot_progress(eligible_orgs_c2, "Measure C", targets_c2, area = "area_a",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C2
+```{r}
+datatable(service_averages(eligible_services_c2, area = "area_a"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C2
+```{r}
+datatable(service_averages(potential_services_c2, area = "area_a"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure D</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target D Q1 2026
+```{r}
+valueBox(target_d_Q1_26[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations that activated the digital ID
+```{r}
+valueBox(nrow(activated_d %>% filter(Area == "AREA_A")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart D
+```{r}
+plot_progress(activated_d, "Measure D", targets_d, area = "area_a",
+              area_col = "Area", y_label = "Activated organizations",
+              fill_col = "Activations", fill_values = id_colors, offset_all = 500)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure E</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target E Q4 2023
+```{r}
+valueBox(target_e_Q4_23[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target E Q2 2026
+```{r}
+valueBox(target_e_Q2_26[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations with Channel E active and a funded application
+```{r}
+valueBox(nrow(activated_e %>% filter(`Org: Area` == "AREA_A")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations E
+```{r}
+valueBox(nrow(potential_e %>% filter(`Org: Area` == "AREA_A")), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart E
+```{r}
+plot_progress(orgs_e, "Measure E", targets_e, area = "area_a",
+              area_col = "Org: Area", y_label = "Organizations",
+              fill_col = "Eligible", fill_values = e_colors, alpha_values = e_alpha)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure F</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target F Q4 2024
+```{r}
+valueBox(target_f_Q4_24[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target F Q2 2026
+```{r}
+valueBox(target_f_Q2_26[["area_a"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### APIs activated under funded applications
+```{r}
+valueBox(nrow(eligible_services_f %>% filter(`Org: Area` == "AREA_A")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart F
+```{r}
+plot_progress(eligible_services_f, "Measure F", targets_f, area = "area_a",
+              area_col = "Org: Area", y_label = "API", offset_area = 50)
+```
+
+
+Area B
+=====================================
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure A</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target A Q3 2024
+```{r}
+valueBox(target_a_Q3_24[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target A Q2 2026
+```{r}
+valueBox(target_a_Q2_26[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_a %>% filter(`Applicant: Area` == "AREA_B") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_a %>% filter(`Applicant: Area` == "AREA_B")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart A
+```{r}
+plot_progress(applications_a, "Measure A", targets_a, area = "area_b",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table A
+```{r}
+datatable(applications_a %>% filter(`Applicant: Area` == "AREA_B") %>% count(Measure = `Measure A`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure B</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target B Q4 2024
+```{r}
+valueBox(target_b_Q4_24[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target B Q2 2026
+```{r}
+valueBox(target_b_Q2_26[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_b %>% filter(`Applicant: Area` == "AREA_B") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_b %>% filter(`Applicant: Area` == "AREA_B")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart B
+```{r}
+plot_progress(applications_b, "Measure B", targets_b, area = "area_b",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table B
+```{r}
+datatable(applications_b %>% filter(`Applicant: Area` == "AREA_B") %>% count(Measure = `Measure B`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 1</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C Q4 2023
+```{r}
+valueBox(target_c1_orgs_Q4_23[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C Q2 2026
+```{r}
+valueBox(target_c1_orgs_Q2_26[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c1 %>% filter(`Org: Area` == "AREA_B")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c1 %>% filter(`Org: Area` == "AREA_B") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C
+```{r}
+plot_progress(eligible_orgs_c1, "Measure C", targets_c1, area = "area_b",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C
+```{r}
+datatable(service_averages(eligible_services_c1, area = "area_b"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C
+```{r}
+datatable(service_averages(potential_services_c1, area = "area_b"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 2</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C2 Q4 2023
+```{r}
+valueBox(target_c2_orgs_Q4_23[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C2 Q2 2026
+```{r}
+valueBox(target_c2_orgs_Q2_26[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c2 %>% filter(`Org: Area` == "AREA_B")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c2 %>% filter(`Org: Area` == "AREA_B") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C2
+```{r}
+plot_progress(eligible_orgs_c2, "Measure C", targets_c2, area = "area_b",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C2
+```{r}
+datatable(service_averages(eligible_services_c2, area = "area_b"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C2
+```{r}
+datatable(service_averages(potential_services_c2, area = "area_b"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure D</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target D Q1 2026
+```{r}
+valueBox(target_d_Q1_26[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations that activated the digital ID
+```{r}
+valueBox(nrow(activated_d %>% filter(Area == "AREA_B")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart D
+```{r}
+plot_progress(activated_d, "Measure D", targets_d, area = "area_b",
+              area_col = "Area", y_label = "Activated organizations",
+              fill_col = "Activations", fill_values = id_colors, offset_all = 500)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure E</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target E Q4 2023
+```{r}
+valueBox(target_e_Q4_23[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target E Q2 2026
+```{r}
+valueBox(target_e_Q2_26[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations with Channel E active and a funded application
+```{r}
+valueBox(nrow(activated_e %>% filter(`Org: Area` == "AREA_B")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations E
+```{r}
+valueBox(nrow(potential_e %>% filter(`Org: Area` == "AREA_B")), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart E
+```{r}
+plot_progress(orgs_e, "Measure E", targets_e, area = "area_b",
+              area_col = "Org: Area", y_label = "Organizations",
+              fill_col = "Eligible", fill_values = e_colors, alpha_values = e_alpha)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure F</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target F Q4 2024
+```{r}
+valueBox(target_f_Q4_24[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target F Q2 2026
+```{r}
+valueBox(target_f_Q2_26[["area_b"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### APIs activated under funded applications
+```{r}
+valueBox(nrow(eligible_services_f %>% filter(`Org: Area` == "AREA_B")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart F
+```{r}
+plot_progress(eligible_services_f, "Measure F", targets_f, area = "area_b",
+              area_col = "Org: Area", y_label = "API", offset_area = 50)
+```
+
+
+Area C
+=====================================
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure A</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target A Q3 2024
+```{r}
+valueBox(target_a_Q3_24[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target A Q2 2026
+```{r}
+valueBox(target_a_Q2_26[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_a %>% filter(`Applicant: Area` == "AREA_C") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_a %>% filter(`Applicant: Area` == "AREA_C")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart A
+```{r}
+plot_progress(applications_a, "Measure A", targets_a, area = "area_c",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table A
+```{r}
+datatable(applications_a %>% filter(`Applicant: Area` == "AREA_C") %>% count(Measure = `Measure A`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure B</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target B Q4 2024
+```{r}
+valueBox(target_b_Q4_24[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target B Q2 2026
+```{r}
+valueBox(target_b_Q2_26[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_b %>% filter(`Applicant: Area` == "AREA_C") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_b %>% filter(`Applicant: Area` == "AREA_C")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart B
+```{r}
+plot_progress(applications_b, "Measure B", targets_b, area = "area_c",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table B
+```{r}
+datatable(applications_b %>% filter(`Applicant: Area` == "AREA_C") %>% count(Measure = `Measure B`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 1</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C Q4 2023
+```{r}
+valueBox(target_c1_orgs_Q4_23[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C Q2 2026
+```{r}
+valueBox(target_c1_orgs_Q2_26[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c1 %>% filter(`Org: Area` == "AREA_C")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c1 %>% filter(`Org: Area` == "AREA_C") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C
+```{r}
+plot_progress(eligible_orgs_c1, "Measure C", targets_c1, area = "area_c",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C
+```{r}
+datatable(service_averages(eligible_services_c1, area = "area_c"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C
+```{r}
+datatable(service_averages(potential_services_c1, area = "area_c"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 2</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C2 Q4 2023
+```{r}
+valueBox(target_c2_orgs_Q4_23[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C2 Q2 2026
+```{r}
+valueBox(target_c2_orgs_Q2_26[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c2 %>% filter(`Org: Area` == "AREA_C")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c2 %>% filter(`Org: Area` == "AREA_C") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C2
+```{r}
+plot_progress(eligible_orgs_c2, "Measure C", targets_c2, area = "area_c",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C2
+```{r}
+datatable(service_averages(eligible_services_c2, area = "area_c"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C2
+```{r}
+datatable(service_averages(potential_services_c2, area = "area_c"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure D</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target D Q1 2026
+```{r}
+valueBox(target_d_Q1_26[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations that activated the digital ID
+```{r}
+valueBox(nrow(activated_d %>% filter(Area == "AREA_C")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart D
+```{r}
+plot_progress(activated_d, "Measure D", targets_d, area = "area_c",
+              area_col = "Area", y_label = "Activated organizations",
+              fill_col = "Activations", fill_values = id_colors, offset_all = 500)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure E</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target E Q4 2023
+```{r}
+valueBox(target_e_Q4_23[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target E Q2 2026
+```{r}
+valueBox(target_e_Q2_26[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations with Channel E active and a funded application
+```{r}
+valueBox(nrow(activated_e %>% filter(`Org: Area` == "AREA_C")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations E
+```{r}
+valueBox(nrow(potential_e %>% filter(`Org: Area` == "AREA_C")), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart E
+```{r}
+plot_progress(orgs_e, "Measure E", targets_e, area = "area_c",
+              area_col = "Org: Area", y_label = "Organizations",
+              fill_col = "Eligible", fill_values = e_colors, alpha_values = e_alpha)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure F</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target F Q4 2024
+```{r}
+valueBox(target_f_Q4_24[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target F Q2 2026
+```{r}
+valueBox(target_f_Q2_26[["area_c"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### APIs activated under funded applications
+```{r}
+valueBox(nrow(eligible_services_f %>% filter(`Org: Area` == "AREA_C")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart F
+```{r}
+plot_progress(eligible_services_f, "Measure F", targets_f, area = "area_c",
+              area_col = "Org: Area", y_label = "API", offset_area = 50)
+```
+
+
+Area D
+=====================================
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure A</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target A Q3 2024
+```{r}
+valueBox(target_a_Q3_24[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target A Q2 2026
+```{r}
+valueBox(target_a_Q2_26[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_a %>% filter(`Applicant: Area` == "AREA_D") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_a %>% filter(`Applicant: Area` == "AREA_D")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart A
+```{r}
+plot_progress(applications_a, "Measure A", targets_a, area = "area_d",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table A
+```{r}
+datatable(applications_a %>% filter(`Applicant: Area` == "AREA_D") %>% count(Measure = `Measure A`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure B</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target B Q4 2024
+```{r}
+valueBox(target_b_Q4_24[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target B Q2 2026
+```{r}
+valueBox(target_b_Q2_26[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_b %>% filter(`Applicant: Area` == "AREA_D") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_b %>% filter(`Applicant: Area` == "AREA_D")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart B
+```{r}
+plot_progress(applications_b, "Measure B", targets_b, area = "area_d",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table B
+```{r}
+datatable(applications_b %>% filter(`Applicant: Area` == "AREA_D") %>% count(Measure = `Measure B`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 1</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C Q4 2023
+```{r}
+valueBox(target_c1_orgs_Q4_23[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C Q2 2026
+```{r}
+valueBox(target_c1_orgs_Q2_26[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c1 %>% filter(`Org: Area` == "AREA_D")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c1 %>% filter(`Org: Area` == "AREA_D") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C
+```{r}
+plot_progress(eligible_orgs_c1, "Measure C", targets_c1, area = "area_d",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C
+```{r}
+datatable(service_averages(eligible_services_c1, area = "area_d"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C
+```{r}
+datatable(service_averages(potential_services_c1, area = "area_d"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 2</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C2 Q4 2023
+```{r}
+valueBox(target_c2_orgs_Q4_23[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C2 Q2 2026
+```{r}
+valueBox(target_c2_orgs_Q2_26[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c2 %>% filter(`Org: Area` == "AREA_D")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c2 %>% filter(`Org: Area` == "AREA_D") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C2
+```{r}
+plot_progress(eligible_orgs_c2, "Measure C", targets_c2, area = "area_d",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C2
+```{r}
+datatable(service_averages(eligible_services_c2, area = "area_d"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C2
+```{r}
+datatable(service_averages(potential_services_c2, area = "area_d"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure D</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target D Q1 2026
+```{r}
+valueBox(target_d_Q1_26[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations that activated the digital ID
+```{r}
+valueBox(nrow(activated_d %>% filter(Area == "AREA_D")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart D
+```{r}
+plot_progress(activated_d, "Measure D", targets_d, area = "area_d",
+              area_col = "Area", y_label = "Activated organizations",
+              fill_col = "Activations", fill_values = id_colors, offset_all = 500)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure E</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target E Q4 2023
+```{r}
+valueBox(target_e_Q4_23[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target E Q2 2026
+```{r}
+valueBox(target_e_Q2_26[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations with Channel E active and a funded application
+```{r}
+valueBox(nrow(activated_e %>% filter(`Org: Area` == "AREA_D")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations E
+```{r}
+valueBox(nrow(potential_e %>% filter(`Org: Area` == "AREA_D")), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart E
+```{r}
+plot_progress(orgs_e, "Measure E", targets_e, area = "area_d",
+              area_col = "Org: Area", y_label = "Organizations",
+              fill_col = "Eligible", fill_values = e_colors, alpha_values = e_alpha)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure F</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target F Q4 2024
+```{r}
+valueBox(target_f_Q4_24[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target F Q2 2026
+```{r}
+valueBox(target_f_Q2_26[["area_d"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### APIs activated under funded applications
+```{r}
+valueBox(nrow(eligible_services_f %>% filter(`Org: Area` == "AREA_D")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart F
+```{r}
+plot_progress(eligible_services_f, "Measure F", targets_f, area = "area_d",
+              area_col = "Org: Area", y_label = "API", offset_area = 50)
+```
+
+
+Area E
+=====================================
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure A</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target A Q3 2024
+```{r}
+valueBox(target_a_Q3_24[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target A Q2 2026
+```{r}
+valueBox(target_a_Q2_26[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_a %>% filter(`Applicant: Area` == "AREA_E") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_a %>% filter(`Applicant: Area` == "AREA_E")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart A
+```{r}
+plot_progress(applications_a, "Measure A", targets_a, area = "area_e",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table A
+```{r}
+datatable(applications_a %>% filter(`Applicant: Area` == "AREA_E") %>% count(Measure = `Measure A`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure B</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target B Q4 2024
+```{r}
+valueBox(target_b_Q4_24[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target B Q2 2026
+```{r}
+valueBox(target_b_Q2_26[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_b %>% filter(`Applicant: Area` == "AREA_E") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_b %>% filter(`Applicant: Area` == "AREA_E")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart B
+```{r}
+plot_progress(applications_b, "Measure B", targets_b, area = "area_e",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table B
+```{r}
+datatable(applications_b %>% filter(`Applicant: Area` == "AREA_E") %>% count(Measure = `Measure B`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 1</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C Q4 2023
+```{r}
+valueBox(target_c1_orgs_Q4_23[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C Q2 2026
+```{r}
+valueBox(target_c1_orgs_Q2_26[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c1 %>% filter(`Org: Area` == "AREA_E")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c1 %>% filter(`Org: Area` == "AREA_E") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C
+```{r}
+plot_progress(eligible_orgs_c1, "Measure C", targets_c1, area = "area_e",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C
+```{r}
+datatable(service_averages(eligible_services_c1, area = "area_e"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C
+```{r}
+datatable(service_averages(potential_services_c1, area = "area_e"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 2</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C2 Q4 2023
+```{r}
+valueBox(target_c2_orgs_Q4_23[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C2 Q2 2026
+```{r}
+valueBox(target_c2_orgs_Q2_26[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c2 %>% filter(`Org: Area` == "AREA_E")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c2 %>% filter(`Org: Area` == "AREA_E") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C2
+```{r}
+plot_progress(eligible_orgs_c2, "Measure C", targets_c2, area = "area_e",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C2
+```{r}
+datatable(service_averages(eligible_services_c2, area = "area_e"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C2
+```{r}
+datatable(service_averages(potential_services_c2, area = "area_e"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure D</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target D Q1 2026
+```{r}
+valueBox(target_d_Q1_26[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations that activated the digital ID
+```{r}
+valueBox(nrow(activated_d %>% filter(Area == "AREA_E")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart D
+```{r}
+plot_progress(activated_d, "Measure D", targets_d, area = "area_e",
+              area_col = "Area", y_label = "Activated organizations",
+              fill_col = "Activations", fill_values = id_colors, offset_all = 500)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure E</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target E Q4 2023
+```{r}
+valueBox(target_e_Q4_23[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target E Q2 2026
+```{r}
+valueBox(target_e_Q2_26[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations with Channel E active and a funded application
+```{r}
+valueBox(nrow(activated_e %>% filter(`Org: Area` == "AREA_E")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations E
+```{r}
+valueBox(nrow(potential_e %>% filter(`Org: Area` == "AREA_E")), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart E
+```{r}
+plot_progress(orgs_e, "Measure E", targets_e, area = "area_e",
+              area_col = "Org: Area", y_label = "Organizations",
+              fill_col = "Eligible", fill_values = e_colors, alpha_values = e_alpha)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure F</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target F Q4 2024
+```{r}
+valueBox(target_f_Q4_24[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target F Q2 2026
+```{r}
+valueBox(target_f_Q2_26[["area_e"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### APIs activated under funded applications
+```{r}
+valueBox(nrow(eligible_services_f %>% filter(`Org: Area` == "AREA_E")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart F
+```{r}
+plot_progress(eligible_services_f, "Measure F", targets_f, area = "area_e",
+              area_col = "Org: Area", y_label = "API", offset_area = 50)
+```
+
+
+Area F
+=====================================
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure A</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target A Q3 2024
+```{r}
+valueBox(target_a_Q3_24[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target A Q2 2026
+```{r}
+valueBox(target_a_Q2_26[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_a %>% filter(`Applicant: Area` == "AREA_F") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_a %>% filter(`Applicant: Area` == "AREA_F")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart A
+```{r}
+plot_progress(applications_a, "Measure A", targets_a, area = "area_f",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table A
+```{r}
+datatable(applications_a %>% filter(`Applicant: Area` == "AREA_F") %>% count(Measure = `Measure A`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure B</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target B Q4 2024
+```{r}
+valueBox(target_b_Q4_24[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target B Q2 2026
+```{r}
+valueBox(target_b_Q2_26[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Applications that passed the technical check
+```{r}
+valueBox(applications_b %>% filter(`Applicant: Area` == "AREA_F") %>%
+  filter(`Progress status` == "Technical check passed") %>%
+  nrow(), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Total active applications
+```{r}
+valueBox(nrow(applications_b %>% filter(`Applicant: Area` == "AREA_F")), color = "#B3FFDA", icon = "fa-solid fa-book")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart B
+```{r}
+plot_progress(applications_b, "Measure B", targets_b, area = "area_f",
+              fill_col = "Progress status", fill_values = fill_colors, alpha_values = fill_alpha)
+```
+
+### Table B
+```{r}
+datatable(applications_b %>% filter(`Applicant: Area` == "AREA_F") %>% count(Measure = `Measure B`, Status = `Progress status`, name = 'Applications'), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 1</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C Q4 2023
+```{r}
+valueBox(target_c1_orgs_Q4_23[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C Q2 2026
+```{r}
+valueBox(target_c1_orgs_Q2_26[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c1 %>% filter(`Org: Area` == "AREA_F")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c1 %>% filter(`Org: Area` == "AREA_F") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C
+```{r}
+plot_progress(eligible_orgs_c1, "Measure C", targets_c1, area = "area_f",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C
+```{r}
+datatable(service_averages(eligible_services_c1, area = "area_f"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C
+```{r}
+datatable(service_averages(potential_services_c1, area = "area_f"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure C - Channel 2</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target ORGANIZATIONS C2 Q4 2023
+```{r}
+valueBox(target_c2_orgs_Q4_23[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target ORGANIZATIONS C2 Q2 2026
+```{r}
+valueBox(target_c2_orgs_Q2_26[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Eligible organizations
+```{r}
+valueBox(nrow(eligible_orgs_c2 %>% filter(`Org: Area` == "AREA_F")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations
+```{r}
+valueBox(nrow(potential_services_c2 %>% filter(`Org: Area` == "AREA_F") %>% distinct(`Org: Org code`)), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart ORGANIZATIONS C2
+```{r}
+plot_progress(eligible_orgs_c2, "Measure C", targets_c2, area = "area_f",
+              area_col = "Org: Area", y_label = "New organizations activated")
+```
+
+### Averages table C2
+```{r}
+datatable(service_averages(eligible_services_c2, area = "area_f"), filter = 'top', fillContainer = TRUE)
+```
+
+### Potential averages table C2
+```{r}
+datatable(service_averages(potential_services_c2, area = "area_f"), filter = 'top', fillContainer = TRUE)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure D</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target D Q1 2026
+```{r}
+valueBox(target_d_Q1_26[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations that activated the digital ID
+```{r}
+valueBox(nrow(activated_d %>% filter(Area == "AREA_F")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart D
+```{r}
+plot_progress(activated_d, "Measure D", targets_d, area = "area_f",
+              area_col = "Area", y_label = "Activated organizations",
+              fill_col = "Activations", fill_values = id_colors, offset_all = 500)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure E</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target E Q4 2023
+```{r}
+valueBox(target_e_Q4_23[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target E Q2 2026
+```{r}
+valueBox(target_e_Q2_26[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Organizations with Channel E active and a funded application
+```{r}
+valueBox(nrow(activated_e %>% filter(`Org: Area` == "AREA_F")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+### Potential organizations E
+```{r}
+valueBox(nrow(potential_e %>% filter(`Org: Area` == "AREA_F")), color = "#B3FFD9", icon = "fa-regular fa-calendar-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart E
+```{r}
+plot_progress(orgs_e, "Measure E", targets_e, area = "area_f",
+              area_col = "Org: Area", y_label = "Organizations",
+              fill_col = "Eligible", fill_values = e_colors, alpha_values = e_alpha)
+```
+
+Row {data-height=80}
+-----------------------------------------------------------------------
+<h1>Measure F</h1>
+
+Row {data-width=200}
+-----------------------------------------------------------------------
+
+### Target F Q4 2024
+```{r}
+valueBox(target_f_Q4_24[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### Target F Q2 2026
+```{r}
+valueBox(target_f_Q2_26[["area_f"]], color = "#0066cc", icon = "fa-solid fa-bullseye")
+```
+
+### APIs activated under funded applications
+```{r}
+valueBox(nrow(eligible_services_f %>% filter(`Org: Area` == "AREA_F")), color = "#00cc66", icon = "fa-solid fa-check")
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+### Chart F
+```{r}
+plot_progress(eligible_services_f, "Measure F", targets_f, area = "area_f",
+              area_col = "Org: Area", y_label = "API", offset_area = 50)
+```
+
+
+Progress monitoring
+=====================================
+
+Row {data-width=1000}
+-----------------------------------------------------------------------
+### Summary chart: progress percentages in each funding window
+```{r, fig.width = 24, fig.height= 12}
+plot_aging
+```
+
+Row {data-width=1000}
+-----------------------------------------------------------------------
+### Progress table by funding window
+```{r}
+datatable(df_aging, filter = 'top', fillContainer = TRUE)
+```
